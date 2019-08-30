@@ -1,0 +1,164 @@
+Centos7下部署skywalking
+IP:192.168.31.28
+软件包版本
+1、elasticsearch-6.3.2.tar.gz
+2、kibana-6.3.2-linux-x86_64.tar.gz
+3、apache-skywalking-apm-incubating-6.0.0-GA.tar.gz
+
+一、安装ES
+下载Elasticsearch 6.5.4 地址：
+       wget https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-6.3.2.tar.gz
+1.拷贝解压
+	#tar -xvzf elasticsearch-6.3.2.tar.gz 。解压后路径：/home/wls81/elasticsearch-6.3.2
+2.创建用户
+	注意：es规定 root用户不能启动es，所以需要创建一个用户来启动es
+	#groupadd wls81
+	#useradd wls81 -g esgroup-p esuser
+	#chown -R wls81:wls81 /home/wls81/elasticsearch-6.3.2
+3.编辑es配置文件
+      #vi /home/wls81/elasticsearch-6.3.2/conf/elasticsearch.yml
+        # 监听访问地址为任意网段
+	network.host: 0.0.0.0
+        # 服务监听端口
+	http.port: 9200		
+	# 集群其他节点IP，只有一个节点写本机ip
+	discovery.zen.ping.unicast.hosts: ["host1"]
+	# 集群节点数量
+	gateway.recover_after_nodes: 1
+4.配置系统参数
+	#vim /etc/security/limits.conf（在文件最后添加）
+	wls81 hard nofile 65536
+	wls81 soft nofile 65536
+	wls81 soft memlock unlimited
+	wls81 hard memlock unlimited
+5.切换wls81用户，启动es
+	#su wls81
+	#./elasticsearch -d  # 加上 -d 参数，后台运行
+
+二、安装Kibana
+# 下载rpm源
+	#wget https://artifacts.elastic.co/downloads/kibana/kibana-6.3.2-x86_64.rpm
+# 安装kibana
+	#rpm -ivh kibana-6.3.2-x86_64.rpm
+# 修改配置
+	#vim /etc/kibana/kibana.yml
+	 server.port: 5601                              
+	 server.host: "192.168.31.28"                   
+	 elasticsearch.url: "http://192.168.31.28:9200"   
+启动服务
+	# 设置开机自启
+	#systemctl enable kibana
+	# 启动Kibana
+	#systemctl start kibana
+
+三、安装Skywalking服务
+# 下载rpm源
+	wget http://mirror.bit.edu.cn/apache/incubator/skywalking/6.0.0-GA/apache-skywalking-apm-incubating-6.0.0-GA.tar.gz
+	tar -zxvf apache-skywalking-apm-incubating-6.0.0-GA.tar.gz
+	mv apache-skywalking-apm-incubating skywalking
+	mv skywalking/ /home/wls81/tomcat
+
+# 编辑skywalking配置文件
+	vim /home/wls81/tomcat/skywalking/config/application.yml
+	修改配置如下：
+	storage:
+	#  h2:
+	#    driver: ${SW_STORAGE_H2_DRIVER:org.h2.jdbcx.JdbcDataSource}
+	#    url: ${SW_STORAGE_H2_URL:jdbc:h2:mem:skywalking-oap-db}
+	#    user: ${SW_STORAGE_H2_USER:sa}
+	elasticsearch:
+		# nameSpace: ${SW_NAMESPACE:""}
+		clusterNodes: ${SW_STORAGE_ES_CLUSTER_NODES:172.16.254.131:9200}
+		indexShardsNumber: ${SW_STORAGE_ES_INDEX_SHARDS_NUMBER:2}
+		indexReplicasNumber: ${SW_STORAGE_ES_INDEX_REPLICAS_NUMBER:0}
+		# Batch process setting, refer to https://www.elastic.co/guide/en/elasticsearch/client/java-api/5.5/java-docs-bulk-processor.html
+		bulkActions: ${SW_STORAGE_ES_BULK_ACTIONS:2000} # Execute the bulk every 2000 requests
+		bulkSize: ${SW_STORAGE_ES_BULK_SIZE:20} # flush the bulk every 20mb
+		flushInterval: ${SW_STORAGE_ES_FLUSH_INTERVAL:10} # flush the bulk every 10 seconds whatever the number of requests
+		concurrentRequests: ${SW_STORAGE_ES_CONCURRENT_REQUESTS:2} # the number of concurrent requests
+
+	vim /home/wls81/tomcat/skywalking/webapp/webapp.yml
+	修改配置如下：
+	server:
+	port: 8081
+	
+	collector:
+	path: /graphql
+	ribbon:
+		ReadTimeout: 10000
+		# Point to all backend's restHost:restPort, split by ,
+		listOfServers: 172.16.254.131:12800
+
+# 启动skywalking
+	cd /home/wls81/tomcat/skywalking/bin/
+	sh startup.sh
+# 检测skywalking
+	lsof -i:8081  #界面端口
+	lsof -i:11800  #服务端端口
+	监听不到11800，则启动
+	sh oapServiceInit.sh
+        sh oapService.sh 
+
+
+四、客户端代理：skywalking-agent
+实际开发时候，每一个jar包获取应用都应该单独使用一个agent，
+所以将agent这个目录拷贝到各自对应服务器的jar包路径下。
+
+核心部分的目录信息如下:
+
+├── activations
+├── config
+│   └── agent.config
+├── logs
+│   └── skywalking-api.log
+├── optional-plugins
+├── plugins
+└── skywalking-agent.jar
+
+其中，config/agent.config是最重要的，需要修改的核心参数如下所示
+
+# 应用名称，当前代理的应用名称，用于UI界面分类和展示
+agent.service_name=${SW_AGENT_NAME:Your_ApplicationName}
+# 收集器的地址，这个根据实际情况设置，上述`Collector`在哪台服务器启动，ip就设置为多少。
+collector.backend_service=${SW_AGENT_COLLECTOR_BACKEND_SERVICES:192.168.31.28:11800}
+
+开发11800、12800端口：
+firewall-cmd --list-ports
+firewall-cmd --zone=public --add-port=11800/tcp --permanent
+firewall-cmd --reload
+
+
+设置好参数后，对于 Java 应用，添加核心的-javaagent进行启动
+java -javaagent:agent/skywalking-agent.jar -jar xxx.jar
+
+idea里启动，添加VM启动参数，例如：
+-javaagent:.../agent/skywalking-agent.jar 
+-Dskywalking.agent.service_name=test_etl-local 
+-Dskywalking.collector.backend_service=172.16.254.131:11800 
+
+
+五、附：启动／关闭命令：
+# 启动ES
+su es
+cd /usr/local/es/elasticsearch-6.3.2/bin/
+./elasticsearch -d
+
+# 关闭ES
+netstat -ntap | grep 9200
+kill -9 pid
+
+# 启动kibana
+su root
+cd /usr/local/kibana/kibana-6.3.2-linux-x86_64/bin/
+nohup ./kibana > /dev/null 2>&1 &
+
+# 关闭kinana
+kill -9 `cat /var/run/kibana.pid`
+
+# 启动skywalking
+cd /usr/local/skywalking/bin/
+sh startup.sh
+
+# 关闭skywalking
+netstat -ntap | grep 8081
+kill -9 pid
